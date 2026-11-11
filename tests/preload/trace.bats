@@ -196,3 +196,18 @@ run_script() {
     [ "$w_msg" = "debug-trap-replaced" ]
   done
 }
+
+@test "concurrent children do not mislabel keywords" {
+  local script="$BATS_TEST_TMPDIR/script.sh"
+  mkscript "$script" \
+    "for r in \$(seq 1 30); do for i in 1 2 3; do echo \$i; done | while read -r l; do ls >/dev/null; done; done"
+
+  for bash_bin in $(get_bashes); do
+    rm -f "$TEST_CTL/trace.log"
+    run_script "$bash_bin" "$script"
+    [ -f "$TEST_CTL/trace.log" ]
+    ! grep -q -E $'^X\t[^\t]*\t(for|while|do|done|echo|read)$' "$TEST_CTL/trace.log"
+    grep -q $'^X\t[^\t]*\tls$' "$TEST_CTL/trace.log"
+  done
+}
+

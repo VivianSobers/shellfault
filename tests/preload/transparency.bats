@@ -110,3 +110,30 @@ mkscript() {
     [ "$r1" != "$r3" ]
   done
 }
+
+@test "noclobber scripts see no preload errors" {
+  local script="$BATS_TEST_TMPDIR/script.sh"
+  mkscript "$script" \
+    "set -C" \
+    "ls >/dev/null" \
+    "echo x"
+
+  local stdout_file="$BATS_TEST_TMPDIR/stdout.log"
+  local stderr_file="$BATS_TEST_TMPDIR/stderr.log"
+
+  for bash_bin in $(get_bashes); do
+    rm -f "$TEST_CTL/trace.log" "$stdout_file" "$stderr_file"
+    (
+      cd "$REPO_ROOT" || exit 1
+      SF_CTL="$TEST_CTL" BASH_ENV="src/preload.bash" "$bash_bin" "$script" >"$stdout_file" 2>"$stderr_file"
+    )
+    local out err
+    out="$(cat "$stdout_file")"
+    err="$(cat "$stderr_file")"
+    [ "$out" = "x" ]
+    [ -z "$err" ]
+    [ -f "$TEST_CTL/trace.log" ]
+    grep -q $'^X\t[^\t]*\tls$' "$TEST_CTL/trace.log"
+  done
+}
+

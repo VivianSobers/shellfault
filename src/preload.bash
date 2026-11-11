@@ -23,6 +23,16 @@ __sf_n=0
 __sf_id=""
 __sf_prev_arg=""
 
+__sf_reserved=" ! [[ ]] case do done elif else esac fi for function if in select then time until while { } coproc "
+__sf_builtins=" "
+while read -r __sf_line; do
+  __sf_bname="${__sf_line##* }"
+  if [ -n "$__sf_bname" ]; then
+    __sf_builtins="${__sf_builtins}${__sf_bname} "
+  fi
+done < <(enable -a)
+unset __sf_line __sf_bname
+
 trap() {
   local __sf_has_debug=0
   local __sf_is_query=0
@@ -110,10 +120,27 @@ __sf_trap() {
         eval "printf 'X\\t%s\\t?\\n' \"\$__sf_id\" >&\$SF_TRACE_FD 2>/dev/null" || :
         ;;
       *)
-        type -t "$__sf_word" > "$SF_CTL/.type_tmp" 2>/dev/null || :
-        local __sf_type="" || :
-        read -r __sf_type < "$SF_CTL/.type_tmp" 2>/dev/null || :
-        if [ "$__sf_type" = "file" ]; then
+        local __sf_is_ext=0
+        case " $__sf_reserved " in
+          *" $__sf_word "*) ;;
+          *)
+            if ! declare -F "$__sf_word" >/dev/null 2>&1; then
+              case " $__sf_builtins " in
+                *" $__sf_word "*) ;;
+                *)
+                  if [[ "$__sf_word" == */* ]]; then
+                    if [ -f "$__sf_word" ] && [ -x "$__sf_word" ]; then
+                      __sf_is_ext=1
+                    fi
+                  elif command -v "$__sf_word" >/dev/null 2>&1; then
+                    __sf_is_ext=1
+                  fi
+                  ;;
+              esac
+            fi
+            ;;
+        esac
+        if [ "$__sf_is_ext" -eq 1 ]; then
           eval "printf 'X\\t%s\\t%s\\n' \"\$__sf_id\" \"\$__sf_word\" >&\$SF_TRACE_FD 2>/dev/null" || :
         fi
         ;;
