@@ -15,7 +15,9 @@ let
       ];
       nativeBuildInputs = [ pkgs.bison ];
       buildInputs = [ pkgs.ncurses ];
-      enableParallelBuilding = true;
+      # Old releases trip -Werror=format-security and race in parallel make.
+      hardeningDisable = [ "format" ];
+      enableParallelBuilding = lib.versionAtLeast spec.version "4.0";
       installPhase = ''
         runHook preInstall
         mkdir -p "$out/bin"
