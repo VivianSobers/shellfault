@@ -13,6 +13,7 @@ let
         "--without-bash-malloc"
         "--with-curses"
       ];
+      nativeBuildInputs = [ pkgs.bison ];
       buildInputs = [ pkgs.ncurses ];
       enableParallelBuilding = true;
       installPhase = ''
