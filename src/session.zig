@@ -54,12 +54,17 @@ pub fn deinitErrors(gpa: Allocator) void {
     }
 }
 
-pub fn printReferenceFailed(io: std.Io) void {
+pub fn printReferenceFailed(io: std.Io, opts: cli.RunOptions) void {
     if (last_ref_exit) |exit| {
-        var line_buf: [256]u8 = undefined;
+        var line_buf: [4096]u8 = undefined;
+        const fallback = "shellfault: reference run failed\n";
         const msg = switch (exit) {
-            .code => |c| std.fmt.bufPrint(&line_buf, "reference run failed (exit {d})\n", .{c}) catch "reference run failed\n",
-            .signal => |s| std.fmt.bufPrint(&line_buf, "reference run failed (signal {d})\n", .{s}) catch "reference run failed\n",
+            // 127 means the command itself could not be started, so name it.
+            .code => |c| if (c == 127)
+                std.fmt.bufPrint(&line_buf, "shellfault: reference run failed (exit 127): could not run {s} {s}\n", .{ opts.bash orelse "the shebang interpreter", opts.script }) catch fallback
+            else
+                std.fmt.bufPrint(&line_buf, "shellfault: reference run failed (exit {d})\n", .{c}) catch fallback,
+            .signal => |s| std.fmt.bufPrint(&line_buf, "shellfault: reference run failed (signal {d})\n", .{s}) catch fallback,
         };
         std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
     }

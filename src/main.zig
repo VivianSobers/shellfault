@@ -41,18 +41,19 @@ pub fn main(init: std.process.Init) u8 {
             defer session.deinitErrors(init.gpa);
             const b = session.baseline(init.gpa, init.io, run_opts) catch |err| {
                 if (err == error.ReferenceFailed) {
-                    session.printReferenceFailed(init.io);
+                    session.printReferenceFailed(init.io, run_opts);
                     return 2;
                 } else if (err == error.Nondeterministic) {
                     session.printNondeterministic(init.io);
                     return 2;
                 } else if (err == error.TraceUnreadable) {
-                    std.Io.File.stderr().writeStreamingAll(init.io, "trace unreadable\n") catch {};
+                    std.Io.File.stderr().writeStreamingAll(init.io, "shellfault: cannot read the trace: TraceUnreadable\n") catch {};
                     return 2;
                 } else if (err == error.OutputInsideFixture) {
-                    std.Io.File.stderr().writeStreamingAll(init.io, "output directory is inside the fixture\n") catch {};
+                    std.Io.File.stderr().writeStreamingAll(init.io, "shellfault: output directory is inside the fixture: OutputInsideFixture\n") catch {};
                     return 2;
                 }
+                reportSetupError(init.gpa, init.io, err, run_opts);
                 return 2;
             };
             defer b.deinit(init.gpa);
@@ -64,18 +65,19 @@ pub fn main(init: std.process.Init) u8 {
             defer session.deinitErrors(init.gpa);
             const b = session.baseline(init.gpa, init.io, run_opts) catch |err| {
                 if (err == error.ReferenceFailed) {
-                    session.printReferenceFailed(init.io);
+                    session.printReferenceFailed(init.io, run_opts);
                     return 2;
                 } else if (err == error.Nondeterministic) {
                     session.printNondeterministic(init.io);
                     return 2;
                 } else if (err == error.TraceUnreadable) {
-                    std.Io.File.stderr().writeStreamingAll(init.io, "trace unreadable\n") catch {};
+                    std.Io.File.stderr().writeStreamingAll(init.io, "shellfault: cannot read the trace: TraceUnreadable\n") catch {};
                     return 2;
                 } else if (err == error.OutputInsideFixture) {
-                    std.Io.File.stderr().writeStreamingAll(init.io, "output directory is inside the fixture\n") catch {};
+                    std.Io.File.stderr().writeStreamingAll(init.io, "shellfault: output directory is inside the fixture: OutputInsideFixture\n") catch {};
                     return 2;
                 }
+                reportSetupError(init.gpa, init.io, err, run_opts);
                 return 2;
             };
             defer b.deinit(init.gpa);
@@ -123,4 +125,25 @@ pub fn main(init: std.process.Init) u8 {
             return 0;
         },
     }
+}
+
+/// Prints one line saying what failed for errors that have no dedicated message.
+fn reportSetupError(gpa: std.mem.Allocator, io: std.Io, err: anyerror, opts: cli.RunOptions) void {
+    const what: []const u8 = switch (err) {
+        error.BadTrace => "cannot parse the trace",
+        error.FileNotFound, error.ExecutableNotFound, error.AccessDenied => "cannot start the run",
+        else => "setup failed",
+    };
+    const line = std.fmt.allocPrint(gpa, "shellfault: {s}: {s} (script {s}, bash {s}, fixture {s})\n", .{
+        what,
+        @errorName(err),
+        opts.script,
+        opts.bash orelse "from shebang",
+        opts.fixture orelse "none",
+    }) catch {
+        std.Io.File.stderr().writeStreamingAll(io, "shellfault: setup failed\n") catch {};
+        return;
+    };
+    defer gpa.free(line);
+    std.Io.File.stderr().writeStreamingAll(io, line) catch {};
 }

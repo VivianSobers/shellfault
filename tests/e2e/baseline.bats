@@ -100,3 +100,13 @@ teardown() {
   [ "$status" -eq 2 ]
   [[ "$output" == *"output directory is inside the fixture"* ]]
 }
+
+@test "setup errors say what failed" {
+  local script="${BATS_TEST_TMPDIR}/s.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'true' > "$script"
+  chmod +x "$script"
+  run --separate-stderr sf run --bash /no/such/bash --out "${BATS_TEST_TMPDIR}/out" "$script"
+  [ "$status" -eq 2 ]
+  [[ "$stderr" == *"shellfault:"* ]]
+  [[ "$stderr" == *"/no/such/bash"* ]]
+}
