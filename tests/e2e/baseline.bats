@@ -46,6 +46,13 @@ teardown() {
   [ "$status" -eq 2 ]
 }
 
+@test "missing trace is an error" {
+  mkscript "s.sh" "echo hi"
+  run sf run --out "${BATS_TEST_TMPDIR}/out" --bash /bin/sh "${BATS_TEST_TMPDIR}/s.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"trace"* ]]
+}
+
 @test "script path and args with spaces and globs" {
   local dir="${BATS_TEST_TMPDIR}/dir with space"
   mkdir -p "$dir"

@@ -251,6 +251,10 @@ fn makeRunId(gpa: Allocator, session_dir: []const u8, run_name: []const u8) ![]c
     return std.fmt.allocPrint(gpa, "{s}-{s}", .{ session_name, run_name });
 }
 
+fn readTraceText(gpa: Allocator, io: std.Io, trace_path: []const u8) ![]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, trace_path, gpa, .limited(256 * 1024 * 1024)) catch error.TraceUnreadable;
+}
+
 pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     deinitErrors(gpa);
 
@@ -380,7 +384,7 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
 
     const ref1_trace_path = try std.Io.Dir.path.join(gpa, &.{ ref1.ctl, "trace.log" });
     defer gpa.free(ref1_trace_path);
-    const ref1_trace_text = std.Io.Dir.cwd().readFileAlloc(io, ref1_trace_path, gpa, .limited(10 * 1024 * 1024)) catch try gpa.dupe(u8, "");
+    const ref1_trace_text = try readTraceText(gpa, io, ref1_trace_path);
     errdefer gpa.free(ref1_trace_text);
 
     const ref1_trace = try trace.parse(gpa, ref1_trace_text);
@@ -424,7 +428,7 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
 
     const ref2_trace_path = try std.Io.Dir.path.join(gpa, &.{ ref2.ctl, "trace.log" });
     defer gpa.free(ref2_trace_path);
-    const ref2_trace_text = std.Io.Dir.cwd().readFileAlloc(io, ref2_trace_path, gpa, .limited(10 * 1024 * 1024)) catch try gpa.dupe(u8, "");
+    const ref2_trace_text = try readTraceText(gpa, io, ref2_trace_path);
     defer gpa.free(ref2_trace_text);
 
     const ref2_trace = try trace.parse(gpa, ref2_trace_text);

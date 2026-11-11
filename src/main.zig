@@ -46,6 +46,9 @@ pub fn main(init: std.process.Init) u8 {
                 } else if (err == error.Nondeterministic) {
                     session.printNondeterministic(init.io);
                     return 2;
+                } else if (err == error.TraceUnreadable) {
+                    std.Io.File.stderr().writeStreamingAll(init.io, "trace unreadable\n") catch {};
+                    return 2;
                 }
                 return 2;
             };
@@ -62,6 +65,9 @@ pub fn main(init: std.process.Init) u8 {
                     return 2;
                 } else if (err == error.Nondeterministic) {
                     session.printNondeterministic(init.io);
+                    return 2;
+                } else if (err == error.TraceUnreadable) {
+                    std.Io.File.stderr().writeStreamingAll(init.io, "trace unreadable\n") catch {};
                     return 2;
                 }
                 return 2;
