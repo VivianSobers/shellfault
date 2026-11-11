@@ -170,8 +170,13 @@ version, the observed output and the decision it implies.
     first word after leading `NAME=value` assignments). If the first word contains `$`, `name` is `?`.
   - `W id source line debug-trap-replaced`: the script set its own `DEBUG` trap at that line.
 - Behavior: only the process whose `$$` equals `SF_ROOT` traces; the preload exports `SF_ROOT=$$` when it is
-  unset, so child Bash scripts stay silent. Pipeline elements and background jobs do not emit `B` records
-  (per S1). `RANDOM` is seeded with `SF_SEED`. A `trap` function wraps the builtin: any call that names
+  unset, so child Bash scripts stay silent. Simple commands in a pipeline or background job are boundaries
+  of the parent, in order, because the parent runs the trap before forking them (spike S1, Bash 3.2 and
+  5.3). Compound commands that run in a child (`... | while read`, `{ ...; } &`) and process substitutions
+  trace with IDs nested under the parent's current boundary; concurrent siblings may produce the same ID,
+  and on Bash 3.2 a process substitution reports `BASH_SUBSHELL=0`, so its IDs can collide with the main
+  process. The engine handles both (Task 8). The trap uses no command substitutions, pipes or external
+  commands. `RANDOM` is seeded with `SF_SEED`. A `trap` function wraps the builtin: any call that names
   `DEBUG` writes the `W` record and is then passed to `builtin trap` unchanged; all other calls pass through
   unchanged, including `trap -p` and `trap -l`.
 
@@ -182,7 +187,10 @@ version, the observed output and the decision it implies.
     gives `1`, `1/1`, `1/2`); `test "function body commands carry the function name"` (`f(){ true; }; f`
     gives a record with `funcs` = `f`); `test "external command is recorded"` (`/bin/ls >/dev/null` and
     `ls >/dev/null` both produce `X` with `ls` or `/bin/ls`); `test "newline and tab in command are
-    escaped"`; `test "child bash script is not traced"`; `test "pipeline elements emit no boundaries"`;
+    escaped"`; `test "child bash script is not traced"`; `test "simple pipeline elements are parent
+    boundaries in order"` (`echo a | cat >/dev/null` gives top-level ids `1` and `2`); `test "loop fed by a
+    pipe is nested under the producer"` (`printf '1\n' | while read -r l; do :; done` gives `1`, then ids
+    starting with `1/`);
     `test "replacing the DEBUG trap is reported"` (script runs `trap 'true' DEBUG` on line 2; expect a `W`
     record with line `2`).
   - `transparency.bats`: `test "exit status visible after command"` (`false; echo $?` prints `1`);
@@ -310,12 +318,17 @@ version, the observed output and the decision it implies.
   - `pub const Trace = struct { boundaries: []Boundary, calls: []Call, warnings: []Warning }`
   - `pub fn parse(gpa, text: []const u8) !Trace`; a malformed line returns `error.BadTrace` and the parser
     records its line number.
+  - `pub fn stable(gpa, a: Trace, b: Trace) ![]const Boundary`: the boundaries of `a`, in order, whose id
+    occurs exactly once in `a` and exactly once in `b` with the same source, line and command. Only stable
+    boundaries can be crash points; the rest are counted as ambiguous.
   - `pub fn firstAndLastPerLine(gpa, bs: []const Boundary) ![]const Boundary`: for each `(source, line)`,
     the first and the last boundary in trace order (one if they are the same), in trace order.
 
 - [ ] **Step 1: Write failing Zig tests:** `test "parses all record kinds"`; `test "unescapes command"`;
   `test "bad line is an error with its number"`; `test "loop line keeps first and last"` (five boundaries
-  on line 3 and one on line 4 give three results, in order).
+  on line 3 and one on line 4 give three results, in order); `test "duplicate id is not stable"`;
+  `test "id with a different command in the second trace is not stable"`; `test "identical traces are
+  fully stable"`.
 - [ ] **Step 2: Run** `zig build test`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `zig build test`. Expected: PASS.
@@ -343,7 +356,10 @@ version, the observed output and the decision it implies.
     `ref1`'s workspace into `rerun`, runs the script there, and fills `rerun`.
   - The Bash used is `opts.bash`, else the interpreter named on the script's `#!` line (`/usr/bin/env bash`
     resolves `bash` on `PATH`), else `bash` on `PATH`.
+  - Crash points are `points.firstAndLastPerLine(trace.stable(ref1, ref2))`, and `Baseline` also carries
+    `ambiguous: usize`, the number of boundaries in `ref1` that are not stable.
   - `shellfault points`: prints one line per selected boundary, `id  source:line  command`, then
+    `skipped: K ambiguous boundaries` when K > 0, then
     `external: name (N calls)` per distinct external command, then each warning as
     `warning: source:line: DEBUG trap replaced; later points are not covered`. Exit 0.
   - `shellfault run`: prints `RERUN: second run failed (exit N)` or `RERUN: second run changed the
