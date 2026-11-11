@@ -71,3 +71,15 @@ teardown() {
   run pgrep -f 'sleep 300'
   [ "$status" -eq 1 ]
 }
+
+@test "absolute workspace paths do not make runs differ" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/abs-path/script.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"baseline ok"* ]]
+}
+
+@test "files kept from the first run do not make the rerun differ" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/abs-path-once/script.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"baseline ok"* ]]
+}

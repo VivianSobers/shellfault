@@ -221,6 +221,31 @@ fn resolveBash(gpa: Allocator, io: std.Io, opts: cli.RunOptions, script_path: []
     return gpa.dupe(u8, "bash");
 }
 
+fn getWsTokens(
+    io: std.Io,
+    ws: []const u8,
+    real_buf: *[std.Io.Dir.max_path_bytes]u8,
+    tokens_buf: *[2][]const u8,
+) ![]const []const u8 {
+    var ws_dir = if (std.fs.path.isAbsolute(ws))
+        try std.Io.Dir.openDirAbsolute(io, ws, .{})
+    else
+        try std.Io.Dir.cwd().openDir(io, ws, .{});
+    defer ws_dir.close(io);
+
+    const real_len = try ws_dir.realPath(io, real_buf);
+    const real_ws = real_buf[0..real_len];
+
+    if (std.mem.eql(u8, ws, real_ws)) {
+        tokens_buf[0] = ws;
+        return tokens_buf[0..1];
+    } else {
+        tokens_buf[0] = ws;
+        tokens_buf[1] = real_ws;
+        return tokens_buf[0..2];
+    }
+}
+
 pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     deinitErrors(gpa);
 
@@ -349,7 +374,11 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     const ref1_trace = try trace.parse(gpa, ref1_trace_text);
     errdefer ref1_trace.deinit(gpa);
 
-    const ref1_manifest = try manifest.build(gpa, io, ref1.ws, &workspace.default_ignores);
+    var ref1_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var ref1_tokens_buf: [2][]const u8 = undefined;
+    const ref1_tokens = try getWsTokens(io, ref1.ws, &ref1_real_buf, &ref1_tokens_buf);
+
+    const ref1_manifest = try manifest.build(gpa, io, ref1.ws, &workspace.default_ignores, ref1_tokens);
     errdefer ref1_manifest.deinit(gpa);
 
     // Run 2: ref2
@@ -389,7 +418,11 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     const ref2_trace = try trace.parse(gpa, ref2_trace_text);
     defer ref2_trace.deinit(gpa);
 
-    const ref2_manifest = try manifest.build(gpa, io, ref2.ws, &workspace.default_ignores);
+    var ref2_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var ref2_tokens_buf: [2][]const u8 = undefined;
+    const ref2_tokens = try getWsTokens(io, ref2.ws, &ref2_real_buf, &ref2_tokens_buf);
+
+    const ref2_manifest = try manifest.build(gpa, io, ref2.ws, &workspace.default_ignores, ref2_tokens);
     defer ref2_manifest.deinit(gpa);
 
     const ref_diff = try manifest.diff(gpa, ref1_manifest, ref2_manifest);
@@ -438,7 +471,16 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     if (res_rerun.timed_out or res_rerun.exit != .code or res_rerun.exit.code != 0) {
         rerun_finding = .{ .failed = res_rerun.exit };
     } else {
-        const rerun_manifest = try manifest.build(gpa, io, rerun_run.ws, &workspace.default_ignores);
+        var rerun_real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var rerun_tokens_buf: [2][]const u8 = undefined;
+        const own_tokens = try getWsTokens(io, rerun_run.ws, &rerun_real_buf, &rerun_tokens_buf);
+        // The rerun starts from a copy of ref1's workspace, so files it leaves alone still hold ref1's path.
+        var all_tokens_buf: [4][]const u8 = undefined;
+        @memcpy(all_tokens_buf[0..own_tokens.len], own_tokens);
+        @memcpy(all_tokens_buf[own_tokens.len .. own_tokens.len + ref1_tokens.len], ref1_tokens);
+        const rerun_tokens = all_tokens_buf[0 .. own_tokens.len + ref1_tokens.len];
+
+        const rerun_manifest = try manifest.build(gpa, io, rerun_run.ws, &workspace.default_ignores, rerun_tokens);
         defer rerun_manifest.deinit(gpa);
 
         const rerun_changes = try manifest.diff(gpa, ref1_manifest, rerun_manifest);

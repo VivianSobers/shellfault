@@ -416,7 +416,71 @@ pub fn diff(gpa: Allocator, a: Manifest, b: Manifest) ![]Change {
     return changes.toOwnedSlice(gpa);
 }
 
-pub fn build(gpa: Allocator, io: std.Io, root: []const u8, ignores: []const []const u8) !Manifest {
+pub const token_replacement = "@SF_WS@";
+pub const max_normalize_file_size: u64 = 64 * 1024 * 1024;
+
+pub fn replaceTokens(gpa: Allocator, input: []const u8, path_tokens: []const []const u8) !?[]u8 {
+    if (path_tokens.len == 0 or input.len == 0) return null;
+
+    var active_tokens: std.ArrayList([]const u8) = .empty;
+    defer active_tokens.deinit(gpa);
+
+    for (path_tokens) |tok| {
+        if (tok.len > 0) {
+            try active_tokens.append(gpa, tok);
+        }
+    }
+    if (active_tokens.items.len == 0) return null;
+
+    var has_match = false;
+    for (active_tokens.items) |tok| {
+        if (std.mem.indexOf(u8, input, tok) != null) {
+            has_match = true;
+            break;
+        }
+    }
+    if (!has_match) return null;
+
+    std.sort.pdq([]const u8, active_tokens.items, {}, struct {
+        fn greaterLength(_: void, a: []const u8, b: []const u8) bool {
+            return a.len > b.len;
+        }
+    }.greaterLength);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var i: usize = 0;
+    var chunk_start: usize = 0;
+    while (i < input.len) {
+        var matched_tok: ?[]const u8 = null;
+        for (active_tokens.items) |tok| {
+            if (std.mem.startsWith(u8, input[i..], tok)) {
+                matched_tok = tok;
+                break;
+            }
+        }
+
+        if (matched_tok) |tok| {
+            if (i > chunk_start) {
+                try out.appendSlice(gpa, input[chunk_start..i]);
+            }
+            try out.appendSlice(gpa, token_replacement);
+            i += tok.len;
+            chunk_start = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    if (chunk_start < input.len) {
+        try out.appendSlice(gpa, input[chunk_start..]);
+    }
+
+    return try out.toOwnedSlice(gpa);
+}
+
+pub fn build(gpa: Allocator, io: std.Io, root: []const u8, ignores: []const []const u8, path_tokens: []const []const u8) !Manifest {
     var root_dir = if (std.fs.path.isAbsolute(root))
         try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true, .follow_symlinks = false })
     else
@@ -432,7 +496,7 @@ pub fn build(gpa: Allocator, io: std.Io, root: []const u8, ignores: []const []co
         entries.deinit(gpa);
     }
 
-    try scanDir(gpa, io, root_dir, "", ignores, &entries);
+    try scanDir(gpa, io, root_dir, "", ignores, path_tokens, &entries);
 
     std.sort.pdq(Entry, entries.items, {}, entryLessThan);
 
@@ -445,6 +509,7 @@ fn scanDir(
     dir: std.Io.Dir,
     rel_prefix: []const u8,
     ignores: []const []const u8,
+    path_tokens: []const []const u8,
     entries: *std.ArrayList(Entry),
 ) !void {
     var iter = dir.iterate();
@@ -479,18 +544,21 @@ fn scanDir(
                 var sub_dir = try dir.openDir(io, ent.name, .{ .iterate = true, .follow_symlinks = false });
                 defer sub_dir.close(io);
 
-                try scanDir(gpa, io, sub_dir, sub_path, ignores, entries);
+                try scanDir(gpa, io, sub_dir, sub_path, ignores, path_tokens, entries);
             },
             .symlink => {
                 var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const link_len = try dir.readLink(io, ent.name, &target_buf);
-                const link = try gpa.dupe(u8, target_buf[0..link_len]);
+                const raw_link = target_buf[0..link_len];
+                const replaced_link = try replaceTokens(gpa, raw_link, path_tokens);
+                const link = if (replaced_link) |r| r else try gpa.dupe(u8, raw_link);
+                errdefer gpa.free(link);
 
                 try entries.append(gpa, .{
                     .path = sub_path,
                     .kind = .symlink,
                     .mode = mode,
-                    .size = stat.size,
+                    .size = link.len,
                     .sha256 = @splat(0),
                     .link = link,
                 });
@@ -499,25 +567,44 @@ fn scanDir(
                 var file = try dir.openFile(io, ent.name, .{});
                 defer file.close(io);
 
-                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-                var read_buf: [8192]u8 = undefined;
-                var offset: u64 = 0;
-                while (true) {
-                    const n = try file.readPositionalAll(io, &read_buf, offset);
-                    if (n == 0) break;
-                    hasher.update(read_buf[0..n]);
-                    offset += n;
-                    if (n < read_buf.len) break;
-                }
-
                 var hash: [32]u8 = undefined;
-                hasher.final(&hash);
+                var final_size: u64 = stat.size;
+
+                if (stat.size <= max_normalize_file_size and path_tokens.len > 0) {
+                    const raw_bytes = try gpa.alloc(u8, @intCast(stat.size));
+                    defer gpa.free(raw_bytes);
+
+                    const n = try file.readPositionalAll(io, raw_bytes, 0);
+                    const content = raw_bytes[0..n];
+
+                    const replaced = try replaceTokens(gpa, content, path_tokens);
+                    if (replaced) |rep| {
+                        defer gpa.free(rep);
+                        final_size = rep.len;
+                        std.crypto.hash.sha2.Sha256.hash(rep, &hash, .{});
+                    } else {
+                        final_size = content.len;
+                        std.crypto.hash.sha2.Sha256.hash(content, &hash, .{});
+                    }
+                } else {
+                    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                    var read_buf: [8192]u8 = undefined;
+                    var offset: u64 = 0;
+                    while (true) {
+                        const n = try file.readPositionalAll(io, &read_buf, offset);
+                        if (n == 0) break;
+                        hasher.update(read_buf[0..n]);
+                        offset += n;
+                        if (n < read_buf.len) break;
+                    }
+                    hasher.final(&hash);
+                }
 
                 try entries.append(gpa, .{
                     .path = sub_path,
                     .kind = .file,
                     .mode = mode,
-                    .size = stat.size,
+                    .size = final_size,
                     .sha256 = hash,
                     .link = "",
                 });
@@ -553,9 +640,9 @@ test "identical trees have no changes" {
     defer sub.close(io);
     try sub.writeFile(io, .{ .sub_path = "nested.txt", .data = "nested content" });
 
-    var m1 = try build(gpa, io, root_path, &.{});
+    var m1 = try build(gpa, io, root_path, &.{}, &.{});
     defer m1.deinit(gpa);
-    var m2 = try build(gpa, io, root_path, &.{});
+    var m2 = try build(gpa, io, root_path, &.{}, &.{});
     defer m2.deinit(gpa);
 
     const changes = try diff(gpa, m1, m2);
@@ -579,14 +666,14 @@ test "detects added removed and content changes" {
     try tmp.dir.writeFile(io, .{ .sub_path = "content.txt", .data = "before" });
     try tmp.dir.writeFile(io, .{ .sub_path = "same.txt", .data = "constant" });
 
-    var m1 = try build(gpa, io, root_path, &.{});
+    var m1 = try build(gpa, io, root_path, &.{}, &.{});
     defer m1.deinit(gpa);
 
     try tmp.dir.deleteFile(io, "removed.txt");
     try tmp.dir.writeFile(io, .{ .sub_path = "content.txt", .data = "after" });
     try tmp.dir.writeFile(io, .{ .sub_path = "added.txt", .data = "hello" });
 
-    var m2 = try build(gpa, io, root_path, &.{});
+    var m2 = try build(gpa, io, root_path, &.{}, &.{});
     defer m2.deinit(gpa);
 
     const changes = try diff(gpa, m1, m2);
@@ -617,12 +704,12 @@ test "mode change is reported" {
     try tmp.dir.writeFile(io, .{ .sub_path = "script.sh", .data = "#!/bin/bash\necho ok\n" });
     try tmp.dir.setFilePermissions(io, "script.sh", .fromMode(0o644), .{});
 
-    var m1 = try build(gpa, io, root_path, &.{});
+    var m1 = try build(gpa, io, root_path, &.{}, &.{});
     defer m1.deinit(gpa);
 
     try tmp.dir.setFilePermissions(io, "script.sh", .fromMode(0o755), .{});
 
-    var m2 = try build(gpa, io, root_path, &.{});
+    var m2 = try build(gpa, io, root_path, &.{}, &.{});
     defer m2.deinit(gpa);
 
     const changes = try diff(gpa, m1, m2);
@@ -646,7 +733,7 @@ test "symlink is recorded not followed" {
 
     try tmp.dir.symLink(io, "/etc", "my_etc", .{});
 
-    var m = try build(gpa, io, root_path, &.{});
+    var m = try build(gpa, io, root_path, &.{}, &.{});
     defer m.deinit(gpa);
 
     try std.testing.expectEqual(1, m.entries.len);
@@ -682,7 +769,7 @@ test "ignore globs" {
     try tmp.dir.writeFile(io, .{ .sub_path = "build.log", .data = "log in root" });
     try tmp.dir.writeFile(io, .{ .sub_path = "root.zig", .data = "pub const x = 1;" });
 
-    var m = try build(gpa, io, root_path, &.{ ".sf-tmp/**", "*.log" });
+    var m = try build(gpa, io, root_path, &.{ ".sf-tmp/**", "*.log" }, &.{});
     defer m.deinit(gpa);
 
     for (m.entries) |entry| {
@@ -797,7 +884,7 @@ test "symlink outside workspace and broken symlink" {
     // Symlink pointing to nonexistent path
     try tmp.dir.symLink(io, "does_not_exist", "broken_link", .{});
 
-    var m = try build(gpa, io, root_path, &.{});
+    var m = try build(gpa, io, root_path, &.{}, &.{});
     defer m.deinit(gpa);
 
     try std.testing.expectEqual(2, m.entries.len);
@@ -870,3 +957,84 @@ test "diff detects kind change and link change" {
     try std.testing.expectEqualStrings("beta", changes[1].path);
     try std.testing.expectEqual(Change.What.link, changes[1].what);
 }
+
+test "workspace path in content is normalized" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp1 = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp1.cleanup();
+    var tmp2 = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+
+    var buf1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len1 = try tmp1.dir.realPath(io, &buf1);
+    const root1 = buf1[0..len1];
+
+    var buf2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len2 = try tmp2.dir.realPath(io, &buf2);
+    const root2 = buf2[0..len2];
+
+    const content1 = try std.fmt.allocPrint(gpa, "PATH={s}/bin\n", .{root1});
+    defer gpa.free(content1);
+    try tmp1.dir.writeFile(io, .{ .sub_path = "profile", .data = content1 });
+
+    const content2 = try std.fmt.allocPrint(gpa, "PATH={s}/bin\n", .{root2});
+    defer gpa.free(content2);
+    try tmp2.dir.writeFile(io, .{ .sub_path = "profile", .data = content2 });
+
+    var m1 = try build(gpa, io, root1, &.{}, &.{root1});
+    defer m1.deinit(gpa);
+    var m2 = try build(gpa, io, root2, &.{}, &.{root2});
+    defer m2.deinit(gpa);
+
+    const changes = try diff(gpa, m1, m2);
+    defer freeChanges(gpa, changes);
+
+    try std.testing.expectEqual(0, changes.len);
+}
+
+test "absolute symlink into workspace is normalized" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp1 = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp1.cleanup();
+    var tmp2 = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp2.cleanup();
+
+    var buf1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len1 = try tmp1.dir.realPath(io, &buf1);
+    const root1 = buf1[0..len1];
+
+    var buf2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len2 = try tmp2.dir.realPath(io, &buf2);
+    const root2 = buf2[0..len2];
+
+    try tmp1.dir.createDir(io, "bin", .default_dir);
+    try tmp2.dir.createDir(io, "bin", .default_dir);
+
+    const target1 = try std.Io.Dir.path.join(gpa, &.{ root1, "bin" });
+    defer gpa.free(target1);
+    try tmp1.dir.symLink(io, target1, "current", .{});
+
+    const target2 = try std.Io.Dir.path.join(gpa, &.{ root2, "bin" });
+    defer gpa.free(target2);
+    try tmp2.dir.symLink(io, target2, "current", .{});
+
+    var m1 = try build(gpa, io, root1, &.{}, &.{root1});
+    defer m1.deinit(gpa);
+    var m2 = try build(gpa, io, root2, &.{}, &.{root2});
+    defer m2.deinit(gpa);
+
+    const changes = try diff(gpa, m1, m2);
+    defer freeChanges(gpa, changes);
+
+    try std.testing.expectEqual(0, changes.len);
+    for (m1.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, "current")) {
+            try std.testing.expectEqualStrings("@SF_WS@/bin", entry.link);
+        }
+    }
+}
+
