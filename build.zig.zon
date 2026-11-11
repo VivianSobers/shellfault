@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .lua = .{
-            .url = "https://www.lua.org/ftp/lua-5.4.8.tar.gz",
-            .hash = "N-V-__8AAKEzFADIYoiDb5IH1KQt0BC_2V2VbHo3SkB5QdrT",
+            .url = "https://github.com/lua/lua/archive/refs/tags/v5.4.8.tar.gz",
+            .hash = "N-V-__8AAMubGQDGjqYOjiMukLr_HqNjQLPBnQBfI_jB0K-r",
         },
     },
     .paths = .{

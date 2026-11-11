@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const lua_dep = b.dependency("lua", .{});
-    const lua_src_path = lua_dep.path("lua-5.4.8/src");
+    const lua_src_path = lua_dep.path(".");
     const lua_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
