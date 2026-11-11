@@ -77,10 +77,13 @@ pub fn run(gpa: Allocator, spec: Spec) !Result {
         if (stdin_fd > 2) _ = std.c.close(stdin_fd);
         if (stdout_fd > 2) _ = std.c.close(stdout_fd);
         if (stderr_fd > 2) _ = std.c.close(stderr_fd);
-        _ = std.c.chdir(cwd_z.ptr);
+        // Never run the command anywhere but its own working directory.
+        if (std.c.chdir(cwd_z.ptr) != 0) std.c.exit(127);
         _ = std.c.execve(exec_path_z.ptr, argv_block.slice.ptr, env_block.slice.ptr);
         std.c.exit(127);
     }
+    // Also set the group from the parent, so signalling -pid cannot race the child's own setpgid.
+    _ = std.c.setpgid(pid, pid);
 
     var status: c_int = 0;
     var timed_out = false;
@@ -408,6 +411,38 @@ fn initTestEnv(gpa: Allocator) !std.process.Environ.Map {
     var env = std.process.Environ.Map.init(gpa);
     try env.put("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     return env;
+}
+
+test "missing cwd does not run the command" {
+    const gpa = std.testing.allocator;
+    var env = try initTestEnv(gpa);
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpDirPath(gpa, &tmp);
+    defer gpa.free(dir);
+    const out = try makePath(gpa, dir, "stdout.log");
+    defer gpa.free(out);
+    const err = try makePath(gpa, dir, "stderr.log");
+    defer gpa.free(err);
+    const missing = try makePath(gpa, dir, "no-such-dir");
+    defer gpa.free(missing);
+
+    const spec = Spec{
+        .argv = &[_][]const u8{ "/bin/sh", "-c", "echo ran" },
+        .env = &env,
+        .cwd = missing,
+        .stdout_path = out,
+        .stderr_path = err,
+        .timeout_ms = 5000,
+        .run_id = "t5-nocwd",
+    };
+    const got = try run(gpa, spec);
+    try std.testing.expectEqualDeep(Exit{ .code = 127 }, got.exit);
+    const stdout = try readFileAlloc(gpa, out, 4096);
+    defer gpa.free(stdout);
+    try std.testing.expectEqualStrings("", stdout);
 }
 
 test "reports exit code" {
