@@ -255,6 +255,27 @@ fn readTraceText(gpa: Allocator, io: std.Io, trace_path: []const u8) ![]const u8
     return std.Io.Dir.cwd().readFileAlloc(io, trace_path, gpa, .limited(256 * 1024 * 1024)) catch error.TraceUnreadable;
 }
 
+fn trimSep(p: []const u8) []const u8 {
+    var s = p;
+    while (s.len > 1 and s[s.len - 1] == std.fs.path.sep) {
+        s = s[0 .. s.len - 1];
+    }
+    return s;
+}
+
+pub fn isInsideOrEqual(child_path: []const u8, parent_path: []const u8) bool {
+    const parent = trimSep(parent_path);
+    const child = trimSep(child_path);
+    if (std.mem.eql(u8, parent, "/")) return true;
+    if (std.mem.eql(u8, child, parent)) return true;
+    if (std.mem.startsWith(u8, child, parent)) {
+        if (child.len > parent.len and child[parent.len] == std.fs.path.sep) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     deinitErrors(gpa);
 
@@ -268,7 +289,43 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
         try std.Io.Dir.path.join(gpa, &.{ cwd, opts.out });
     defer gpa.free(abs_out);
 
-    try std.Io.Dir.cwd().createDirPath(io, abs_out);
+    const abs_fixture = if (opts.fixture) |fix|
+        if (std.fs.path.isAbsolute(fix))
+            try gpa.dupe(u8, fix)
+        else
+            try std.Io.Dir.path.join(gpa, &.{ cwd, fix })
+    else
+        null;
+    defer if (abs_fixture) |fix| gpa.free(fix);
+
+    if (abs_fixture) |fix| {
+        var fix_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var fix_dir = if (std.fs.path.isAbsolute(fix))
+            try std.Io.Dir.openDirAbsolute(io, fix, .{})
+        else
+            try std.Io.Dir.cwd().openDir(io, fix, .{});
+        defer fix_dir.close(io);
+        const fix_real_len = try fix_dir.realPath(io, &fix_buf);
+        const fix_real = fix_buf[0..fix_real_len];
+
+        try std.Io.Dir.cwd().createDirPath(io, abs_out);
+
+        var out_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var out_dir = if (std.fs.path.isAbsolute(abs_out))
+            try std.Io.Dir.openDirAbsolute(io, abs_out, .{})
+        else
+            try std.Io.Dir.cwd().openDir(io, abs_out, .{});
+        defer out_dir.close(io);
+        const out_real_len = try out_dir.realPath(io, &out_buf);
+        const out_real = out_buf[0..out_real_len];
+
+        if (isInsideOrEqual(out_real, fix_real)) {
+            std.Io.Dir.cwd().deleteDir(io, abs_out) catch {};
+            return error.OutputInsideFixture;
+        }
+    } else {
+        try std.Io.Dir.cwd().createDirPath(io, abs_out);
+    }
 
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
@@ -317,14 +374,6 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
         try file.writeStreamingAll(io, preload_bash);
     }
 
-    const abs_fixture = if (opts.fixture) |fix|
-        if (std.fs.path.isAbsolute(fix))
-            try gpa.dupe(u8, fix)
-        else
-            try std.Io.Dir.path.join(gpa, &.{ cwd, fix })
-    else
-        null;
-    defer if (abs_fixture) |fix| gpa.free(fix);
 
     const abs_script = if (std.fs.path.isAbsolute(opts.script))
         try gpa.dupe(u8, opts.script)
@@ -654,4 +703,15 @@ test "baseline on failing script returns ReferenceFailed" {
     try std.testing.expectError(error.ReferenceFailed, res);
     try std.testing.expect(last_ref_exit != null);
     try std.testing.expectEqual(@as(u8, 17), last_ref_exit.?.code);
+}
+
+test "isInsideOrEqual detects output inside fixture" {
+    try std.testing.expect(isInsideOrEqual("/a/b/out", "/a/b"));
+    try std.testing.expect(isInsideOrEqual("/a/b", "/a/b"));
+    try std.testing.expect(isInsideOrEqual("/a/b/out/sub", "/a/b"));
+    try std.testing.expect(isInsideOrEqual("/a/b/out", "/a/b/"));
+    try std.testing.expect(!isInsideOrEqual("/a/bc", "/a/b"));
+    try std.testing.expect(!isInsideOrEqual("/a/x", "/a/b"));
+    try std.testing.expect(!isInsideOrEqual("/a", "/a/b"));
+    try std.testing.expect(isInsideOrEqual("/a/b", "/"));
 }

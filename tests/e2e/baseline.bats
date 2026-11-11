@@ -90,3 +90,13 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"baseline ok"* ]]
 }
+
+@test "output inside the fixture is refused" {
+  local fix_dir="${BATS_TEST_TMPDIR}/fixture"
+  mkdir -p "$fix_dir"
+  mkscript "fixture/script.sh" "echo hi"
+  cd "$fix_dir" || exit 1
+  run sf run --fixture . script.sh
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"output directory is inside the fixture"* ]]
+}
