@@ -35,6 +35,24 @@ const linux_impl = struct {
     const AT = linux.AT;
     const S = linux.S;
 
+    fn mapLinuxError(rc: anytype) !void {
+        const err = linux.errno(rc);
+        return switch (err) {
+            .SUCCESS => {},
+            .NOENT => error.FileNotFound,
+            .EXIST => error.PathAlreadyExists,
+            .ACCES, .PERM => error.AccessDenied,
+            .NOSPC => error.NoSpaceLeft,
+            .NAMETOOLONG => error.NameTooLong,
+            .NOTDIR => error.NotDir,
+            .ISDIR => error.IsDir,
+            .LOOP => error.SymLinkLoop,
+            .ROFS => error.ReadOnlyFileSystem,
+            .INVAL => error.InvalidArgument,
+            else => error.SystemResources,
+        };
+    }
+
     fn cloneTreeLinux(src: []const u8, dst: []const u8) !CloneKind {
         var src_buf: [Io.Dir.max_path_bytes]u8 = undefined;
         var dst_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -48,38 +66,37 @@ const linux_impl = struct {
 
         var stx: linux.Statx = undefined;
         const stat_rc = linux.statx(AT.FDCWD, src_z, AT.SYMLINK_NOFOLLOW, linux.STATX{ .TYPE = true, .MODE = true }, &stx);
-        if (linux.errno(stat_rc) != .SUCCESS) {
-            return error.FileNotFound;
-        }
+        try mapLinuxError(stat_rc);
 
         if (S.ISLNK(stx.mode)) {
             var target_buf: [Io.Dir.max_path_bytes]u8 = undefined;
             const link_len = linux.readlinkat(AT.FDCWD, src_z, &target_buf, target_buf.len);
-            if (linux.errno(link_len) != .SUCCESS) return error.SystemResources;
+            try mapLinuxError(link_len);
             if (link_len >= target_buf.len) return error.NameTooLong;
             target_buf[link_len] = 0;
             const target_z: [*:0]const u8 = target_buf[0..link_len :0];
             const sym_rc = linux.symlinkat(target_z, AT.FDCWD, dst_z);
-            if (linux.errno(sym_rc) != .SUCCESS) return error.PathAlreadyExists;
+            try mapLinuxError(sym_rc);
             return .copy;
         } else if (S.ISREG(stx.mode)) {
             return cloneRegularFile(AT.FDCWD, src_z, AT.FDCWD, dst_z, stx.mode & 0o7777);
         } else if (S.ISDIR(stx.mode)) {
-            const mkdir_rc = linux.mkdirat(AT.FDCWD, dst_z, stx.mode & 0o7777);
-            if (linux.errno(mkdir_rc) != .SUCCESS) return error.PathAlreadyExists;
+            const mkdir_rc = linux.mkdirat(AT.FDCWD, dst_z, 0o700);
+            try mapLinuxError(mkdir_rc);
 
             const open_src = linux.openat(AT.FDCWD, src_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-            if (linux.errno(open_src) != .SUCCESS) return error.FileNotFound;
+            try mapLinuxError(open_src);
             const src_fd: linux.fd_t = @intCast(open_src);
             defer _ = linux.close(src_fd);
 
             const open_dst = linux.openat(AT.FDCWD, dst_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-            if (linux.errno(open_dst) != .SUCCESS) return error.FileNotFound;
+            try mapLinuxError(open_dst);
             const dst_fd: linux.fd_t = @intCast(open_dst);
             defer _ = linux.close(dst_fd);
 
             var result: CloneKind = .ficlone;
             try cloneDirChildren(src_fd, dst_fd, &result);
+            try mapLinuxError(linux.fchmod(dst_fd, stx.mode & 0o7777));
             return result;
         } else {
             return error.InvalidArgument;
@@ -88,12 +105,12 @@ const linux_impl = struct {
 
     fn cloneRegularFile(src_dfd: linux.fd_t, src_name: [*:0]const u8, dst_dfd: linux.fd_t, dst_name: [*:0]const u8, mode: u32) !CloneKind {
         const open_src = linux.openat(src_dfd, src_name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(open_src) != .SUCCESS) return error.FileNotFound;
+        try mapLinuxError(open_src);
         const sfd: linux.fd_t = @intCast(open_src);
         defer _ = linux.close(sfd);
 
         const open_dst = linux.openat(dst_dfd, dst_name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, mode);
-        if (linux.errno(open_dst) != .SUCCESS) return error.PathAlreadyExists;
+        try mapLinuxError(open_dst);
         const dfd: linux.fd_t = @intCast(open_dst);
         defer _ = linux.close(dfd);
 
@@ -107,11 +124,11 @@ const linux_impl = struct {
         while (true) {
             const n = linux.read(sfd, &buf, buf.len);
             if (n == 0) break;
-            if (linux.errno(n) != .SUCCESS) return error.SystemResources;
+            try mapLinuxError(n);
             var written: usize = 0;
             while (written < n) {
                 const w = linux.write(dfd, buf[written..n].ptr, n - written);
-                if (linux.errno(w) != .SUCCESS) return error.SystemResources;
+                try mapLinuxError(w);
                 written += w;
             }
         }
@@ -123,7 +140,7 @@ const linux_impl = struct {
         while (true) {
             const nread = linux.getdents64(src_dfd, &buf, buf.len);
             if (nread == 0) break;
-            if (linux.errno(nread) != .SUCCESS) return error.SystemResources;
+            try mapLinuxError(nread);
 
             var bpos: usize = 0;
             while (bpos < nread) {
@@ -138,34 +155,39 @@ const linux_impl = struct {
 
                 var stx: linux.Statx = undefined;
                 const stat_rc = linux.statx(src_dfd, name_ptr, AT.SYMLINK_NOFOLLOW, linux.STATX{ .TYPE = true, .MODE = true }, &stx);
-                if (linux.errno(stat_rc) != .SUCCESS) continue;
+                try mapLinuxError(stat_rc);
 
                 if (S.ISLNK(stx.mode)) {
                     var target_buf: [Io.Dir.max_path_bytes]u8 = undefined;
                     const link_len = linux.readlinkat(src_dfd, name_ptr, &target_buf, target_buf.len);
-                    if (linux.errno(link_len) != .SUCCESS) return error.SystemResources;
+                    try mapLinuxError(link_len);
                     if (link_len >= target_buf.len) return error.NameTooLong;
                     target_buf[link_len] = 0;
                     const target_z: [*:0]const u8 = target_buf[0..link_len :0];
-                    _ = linux.symlinkat(target_z, dst_dfd, name_ptr);
+                    const sym_rc = linux.symlinkat(target_z, dst_dfd, name_ptr);
+                    try mapLinuxError(sym_rc);
                 } else if (S.ISDIR(stx.mode)) {
-                    _ = linux.mkdirat(dst_dfd, name_ptr, stx.mode & 0o7777);
+                    const mkdir_rc = linux.mkdirat(dst_dfd, name_ptr, 0o700);
+                    try mapLinuxError(mkdir_rc);
                     const open_child_src = linux.openat(src_dfd, name_ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-                    if (linux.errno(open_child_src) == .SUCCESS) {
-                        const child_src_fd: linux.fd_t = @intCast(open_child_src);
-                        defer _ = linux.close(child_src_fd);
-                        const open_child_dst = linux.openat(dst_dfd, name_ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-                        if (linux.errno(open_child_dst) == .SUCCESS) {
-                            const child_dst_fd: linux.fd_t = @intCast(open_child_dst);
-                            defer _ = linux.close(child_dst_fd);
-                            try cloneDirChildren(child_src_fd, child_dst_fd, result);
-                        }
-                    }
+                    try mapLinuxError(open_child_src);
+                    const child_src_fd: linux.fd_t = @intCast(open_child_src);
+                    defer _ = linux.close(child_src_fd);
+
+                    const open_child_dst = linux.openat(dst_dfd, name_ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+                    try mapLinuxError(open_child_dst);
+                    const child_dst_fd: linux.fd_t = @intCast(open_child_dst);
+                    defer _ = linux.close(child_dst_fd);
+
+                    try cloneDirChildren(child_src_fd, child_dst_fd, result);
+                    try mapLinuxError(linux.fchmod(child_dst_fd, stx.mode & 0o7777));
                 } else if (S.ISREG(stx.mode)) {
                     const file_kind = try cloneRegularFile(src_dfd, name_ptr, dst_dfd, name_ptr, stx.mode & 0o7777);
                     if (file_kind == .copy) {
                         result.* = .copy;
                     }
+                } else {
+                    return error.InvalidArgument;
                 }
             }
         }
@@ -520,6 +542,107 @@ test "FICLONE clones files on Linux" {
     const kind = try cloneTree(src_path, dst_path);
     std.debug.print("Linux cloneTree used {s}\n", .{@tagName(kind)});
     try std.testing.expect(kind == .ficlone or kind == .copy);
+}
+
+test "linux clone copies contents of read-only directory" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tmp_path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
+    const tmp_path = tmp_path_buf[0..tmp_len];
+
+    const src_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "src" });
+    defer std.testing.allocator.free(src_path);
+    try Io.Dir.cwd().createDirPath(std.testing.io, src_path);
+
+    const ro_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "ro" });
+    defer std.testing.allocator.free(ro_path);
+    try Io.Dir.cwd().createDirPath(std.testing.io, ro_path);
+
+    const a_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ ro_path, "a.txt" });
+    defer std.testing.allocator.free(a_path);
+    const file = try Io.Dir.cwd().createFile(std.testing.io, a_path, .{});
+    try file.writeStreamingAll(std.testing.io, "hello");
+    file.close(std.testing.io);
+
+    try Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        ro_path,
+        Io.File.Permissions.fromMode(0o555),
+        .{ .follow_symlinks = false },
+    );
+    defer Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        ro_path,
+        Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    ) catch {};
+
+    const dst_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "dst" });
+    defer std.testing.allocator.free(dst_path);
+
+    const dst_ro_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_path, "ro" });
+    defer std.testing.allocator.free(dst_ro_path);
+    defer Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        dst_ro_path,
+        Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    ) catch {};
+
+    _ = try cloneTree(src_path, dst_path);
+
+    const dst_a_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_ro_path, "a.txt" });
+    defer std.testing.allocator.free(dst_a_path);
+
+    const content = try Io.Dir.cwd().readFileAlloc(std.testing.io, dst_a_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("hello", content);
+
+    const ro_stat = try Io.Dir.cwd().statFile(std.testing.io, dst_ro_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o555), ro_stat.permissions.toMode() & 0o777);
+}
+
+test "linux clone reports an unreadable file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tmp_path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
+    const tmp_path = tmp_path_buf[0..tmp_len];
+
+    const src_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "src" });
+    defer std.testing.allocator.free(src_path);
+    try Io.Dir.cwd().createDirPath(std.testing.io, src_path);
+
+    const file_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "unreadable.txt" });
+    defer std.testing.allocator.free(file_path);
+    const file = try Io.Dir.cwd().createFile(std.testing.io, file_path, .{});
+    file.close(std.testing.io);
+
+    try Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        file_path,
+        Io.File.Permissions.fromMode(0o000),
+        .{ .follow_symlinks = false },
+    );
+    defer Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        file_path,
+        Io.File.Permissions.fromMode(0o644),
+        .{ .follow_symlinks = false },
+    ) catch {};
+
+    const dst_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "dst" });
+    defer std.testing.allocator.free(dst_path);
+
+    const res = cloneTree(src_path, dst_path);
+    try std.testing.expectError(error.AccessDenied, res);
 }
 
 
