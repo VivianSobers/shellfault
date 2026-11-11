@@ -98,8 +98,8 @@ The preload:
   line per boundary: ID, `BASH_SOURCE`, `LINENO`, the `FUNCNAME` stack and `BASH_COMMAND`;
 - in a fault trial, checks each boundary against the target and fires the fault when it matches;
 - defines the wrapper functions used for failure injection and stubs;
-- seeds `RANDOM` from the run seed and exports `TZ=UTC`, `LC_ALL=C` and `SOURCE_DATE_EPOCH`, so that runs
-  are as deterministic as possible.
+- seeds `RANDOM` from the run seed, while the engine sets `TZ=UTC`, `LC_ALL=C` and `SOURCE_DATE_EPOCH` in
+  the run's environment, so that runs are as deterministic as possible.
 
 The engine and the preload talk through environment variables (`SF_*`) and files in a per-run control
 directory: the trace, the fault record, and the effects journal. The preload never reads anything it did
@@ -333,6 +333,7 @@ in the workspace at the moment of the crash or at the end of the recovery run, f
 ```
 shellfault run [options] [SCRIPT] [-- ARGS...]
     -f, --scenario FILE      Lua scenario (default ./shellfault.lua if present)
+        --fixture DIR        initial state to copy, when there is no scenario
     -m, --mode MODE          crash | fail | both (default both)
     -s, --signal SIG         KILL | TERM | INT | HUP (crash mode, default KILL)
     -j, --jobs N             trials run in parallel, each in its own workspace
