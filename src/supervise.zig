@@ -305,7 +305,7 @@ fn cleanupLinux(gpa: Allocator, run_id: []const u8) !u32 {
     const my_pid = std.c.getpid();
 
     while (std.c.readdir(dir)) |entry| {
-        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.d_name)), 0);
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
         const pid = std.fmt.parseInt(i32, name, 10) catch continue;
         if (pid <= 1 or pid == my_pid) continue;
 
