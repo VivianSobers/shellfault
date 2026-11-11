@@ -51,5 +51,7 @@ done
 
 run_step "zig build -Dtarget=x86_64-linux-musl" zig build -Dtarget=x86_64-linux-musl
 run_step "zig build -Dtarget=aarch64-macos" zig build -Dtarget=aarch64-macos
+run_step "zig build test-build -Dtarget=x86_64-linux-musl" zig build test-build -Dtarget=x86_64-linux-musl
+run_step "zig build test-build -Dtarget=aarch64-macos" zig build test-build -Dtarget=aarch64-macos
 
 echo "All checks passed."

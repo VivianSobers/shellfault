@@ -107,6 +107,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Compile the unit tests without running them, so other targets' test code is checked too.
+    const test_build_step = b.step("test-build", "Compile unit tests without running them");
+    test_build_step.dependOn(&b.addInstallArtifact(unit_tests, .{}).step);
+
     const e2e_step = b.step("e2e", "Run e2e tests");
     const bats_cmd = b.addSystemCommand(&.{ "bats", "tests/e2e" });
     bats_cmd.setCwd(b.path("."));
