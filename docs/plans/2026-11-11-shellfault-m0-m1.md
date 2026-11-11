@@ -383,23 +383,55 @@ version, the observed output and the decision it implies.
 - [ ] **Step 5: Run** `zig build test e2e` on macOS and Linux. Expected: PASS.
 - [ ] **Step 6: Commit** `feat: add baseline points and rerun`
 
-### Task 10: Checks and CI
+### Task 9b: Normalize workspace paths
+
+Added after Task 9: an installer that writes `$PWD/bin` into `~/.profile` was reported nondeterministic,
+because each run has a different workspace path.
 
 **Files:**
-- Modify: `flake.nix` (add `checks`)
-- Create: `.github/workflows/ci.yml`
+- Modify: `src/manifest.zig`, `src/session.zig`
+- Create: `tests/corpus/abs-path/script.sh`, a test in `tests/e2e/baseline.bats`
 
 **Interfaces:**
-- Produces: `nix flake check` runs `zig build test`, `zig build e2e`, `bats tests/preload` against every
-  Bash in the matrix, and `shellcheck -x` over all shell files. CI runs `nix flake check` on
-  `ubuntu-latest` and `macos-latest` for pushes and pull requests to `main`.
+- Changes: `manifest.build(gpa, io, root, ignores, path_tokens: []const []const u8) !Manifest`. Before
+  hashing a regular file of at most 64 MiB, and before recording a symlink target, every occurrence of any
+  string in `path_tokens` is replaced by `@SF_WS@`; `size` is the size after replacement. Larger files are
+  hashed unchanged.
+- `session.baseline` passes, for each run, `{ run.ws, realpath(run.ws) }` (one entry if they are equal).
 
-- [ ] **Step 1: Add the checks**, then break one shell file on purpose (an unquoted `$var`) and run
-  `nix flake check`. Expected: FAIL naming that file. Revert the break.
-- [ ] **Step 2: Run** `nix flake check` on macOS and Linux. Expected: PASS.
+- [ ] **Step 1: Write failing tests.** Zig: `test "workspace path in content is normalized"` (two trees at
+  different paths, each with a file containing its own absolute root path, give equal manifests when built
+  with their own root as token) and `test "absolute symlink into workspace is normalized"`. Corpus
+  `abs-path/script.sh`: `printf 'PATH=%s/bin\n' "$PWD" >> "$HOME/.profile"; mkdir -p bin; ln -sfn "$PWD/bin"
+  current`. Bats `test "absolute workspace paths do not make runs differ"`: `shellfault run` on it exits 0
+  with `baseline ok`.
+- [ ] **Step 2: Run** `zig build test` and `zig build e2e`. Expected: the new tests FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** both again. Expected: PASS.
+- [ ] **Step 5: Commit** `fix: normalize workspace paths in manifests`
+
+### Task 10: Checks and CI
+
+Revised after Tasks 1 to 9: `zig build` downloads the Lua sources, and Nix's build sandbox has no network,
+so the checks run inside `nix develop` instead of as `nix flake check` derivations. Linux-only code was
+also once merged without being compiled for Linux, so the checks cross-compile.
+
+**Files:**
+- Create: `scripts/check.sh`, `.github/workflows/ci.yml`
+
+**Interfaces:**
+- Produces: `nix develop -c scripts/check.sh` runs, stopping at the first failure and naming it:
+  `zig build test`, `zig build e2e`, `bats tests/preload` (every Bash in `SF_TEST_BASHES`),
+  `shellcheck -x` over every `*.sh`, `*.bash` and `*.bats` file tracked by git, and
+  `zig build -Dtarget=x86_64-linux-musl` and `zig build -Dtarget=aarch64-macos` (cross-compile only).
+  CI runs it on `ubuntu-latest` and `macos-latest` for pushes and pull requests to `main`.
+
+- [ ] **Step 1: Write `scripts/check.sh`**, then break one shell file on purpose (an unquoted `$var`) and run
+  `nix develop -c scripts/check.sh`. Expected: FAIL naming that file. Revert the break.
+- [ ] **Step 2: Run** `nix develop -c scripts/check.sh` on macOS and Linux. Expected: PASS.
 - [ ] **Step 3: Add the workflow** with `DeterminateSystems/nix-installer-action` and
-  `DeterminateSystems/magic-nix-cache-action`.
-- [ ] **Step 4: Commit** `ci: run flake checks on push`
+  `DeterminateSystems/magic-nix-cache-action`, running `nix develop -c scripts/check.sh`.
+- [ ] **Step 4: Commit** `ci: run checks on push`
 
 ## Execution notes
 
