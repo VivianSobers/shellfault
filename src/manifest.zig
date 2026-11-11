@@ -518,10 +518,10 @@ fn scanDir(
             try gpa.dupe(u8, ent.name)
         else
             try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, ent.name });
-        errdefer gpa.free(sub_path);
+        var sub_path_owned = true;
+        defer if (sub_path_owned) gpa.free(sub_path);
 
         if (isIgnored(ignores, sub_path)) {
-            gpa.free(sub_path);
             continue;
         }
 
@@ -540,6 +540,7 @@ fn scanDir(
                     .sha256 = @splat(0),
                     .link = "",
                 });
+                sub_path_owned = false;
 
                 var sub_dir = try dir.openDir(io, ent.name, .{ .iterate = true, .follow_symlinks = false });
                 defer sub_dir.close(io);
@@ -552,7 +553,8 @@ fn scanDir(
                 const raw_link = target_buf[0..link_len];
                 const replaced_link = try replaceTokens(gpa, raw_link, path_tokens);
                 const link = if (replaced_link) |r| r else try gpa.dupe(u8, raw_link);
-                errdefer gpa.free(link);
+                var link_owned = true;
+                defer if (link_owned) gpa.free(link);
 
                 try entries.append(gpa, .{
                     .path = sub_path,
@@ -562,6 +564,8 @@ fn scanDir(
                     .sha256 = @splat(0),
                     .link = link,
                 });
+                sub_path_owned = false;
+                link_owned = false;
             },
             .file => {
                 var file = try dir.openFile(io, ent.name, .{});
@@ -608,6 +612,7 @@ fn scanDir(
                     .sha256 = hash,
                     .link = "",
                 });
+                sub_path_owned = false;
             },
             .other => {
                 try entries.append(gpa, .{
@@ -618,6 +623,7 @@ fn scanDir(
                     .sha256 = @splat(0),
                     .link = "",
                 });
+                sub_path_owned = false;
             },
         }
     }
@@ -1036,5 +1042,34 @@ test "absolute symlink into workspace is normalized" {
             try std.testing.expectEqualStrings("@SF_WS@/bin", entry.link);
         }
     }
+}
+
+test "unreadable subdirectory is an error without double free" {
+    if (std.c.getuid() == 0) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const root_path = dir_buf[0..dir_len];
+
+    try tmp.dir.createDir(io, "a", .default_dir);
+    var a_dir = try tmp.dir.openDir(io, "a", .{ .iterate = true });
+    defer a_dir.close(io);
+
+    try a_dir.createDir(io, "locked", .default_dir);
+    var locked_dir = try a_dir.openDir(io, "locked", .{ .iterate = true });
+    try locked_dir.writeFile(io, .{ .sub_path = "f.txt", .data = "secret" });
+    locked_dir.close(io);
+
+    try a_dir.setFilePermissions(io, "locked", .fromMode(0o000), .{});
+    defer a_dir.setFilePermissions(io, "locked", .fromMode(0o755), .{}) catch {};
+
+    const res = build(gpa, io, root_path, &.{}, &.{});
+    try std.testing.expectError(error.AccessDenied, res);
 }
 
