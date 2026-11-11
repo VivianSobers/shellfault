@@ -194,6 +194,151 @@ const linux_impl = struct {
     }
 };
 
+fn mapCError() !void {
+    const err = std.c._errno().*;
+    return switch (err) {
+        @intFromEnum(std.posix.E.SUCCESS) => {},
+        @intFromEnum(std.posix.E.NOENT) => error.FileNotFound,
+        @intFromEnum(std.posix.E.EXIST) => error.PathAlreadyExists,
+        @intFromEnum(std.posix.E.ACCES), @intFromEnum(std.posix.E.PERM) => error.AccessDenied,
+        @intFromEnum(std.posix.E.NOSPC) => error.NoSpaceLeft,
+        @intFromEnum(std.posix.E.NAMETOOLONG) => error.NameTooLong,
+        @intFromEnum(std.posix.E.NOTDIR) => error.NotDir,
+        @intFromEnum(std.posix.E.ISDIR) => error.IsDir,
+        @intFromEnum(std.posix.E.LOOP) => error.SymLinkLoop,
+        @intFromEnum(std.posix.E.ROFS) => error.ReadOnlyFileSystem,
+        @intFromEnum(std.posix.E.INVAL) => error.InvalidArgument,
+        else => error.SystemResources,
+    };
+}
+
+fn copyTreeInner(src_z: [*:0]const u8, dst_z: [*:0]const u8) !void {
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, src_z, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) {
+        try mapCError();
+        return error.SystemResources;
+    }
+
+    if (std.c.S.ISLNK(st.mode)) {
+        var target_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const n = std.c.readlink(src_z, &target_buf, target_buf.len);
+        if (n < 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        if (n >= target_buf.len) return error.NameTooLong;
+        target_buf[@intCast(n)] = 0;
+        const target_z: [*:0]const u8 = target_buf[0..@intCast(n) :0];
+        if (std.c.symlink(target_z, dst_z) != 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        return;
+    } else if (std.c.S.ISREG(st.mode)) {
+        const sfd = std.c.open(src_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+        if (sfd < 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        defer _ = std.c.close(sfd);
+
+        const file_mode: std.c.mode_t = @truncate(@as(u32, st.mode) & 0o7777);
+        const dfd = std.c.open(dst_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, file_mode);
+        if (dfd < 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        defer _ = std.c.close(dfd);
+
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = std.c.read(sfd, &buf, buf.len);
+            if (n == 0) break;
+            if (n < 0) {
+                try mapCError();
+                return error.SystemResources;
+            }
+            var written: usize = 0;
+            const to_write: usize = @intCast(n);
+            while (written < to_write) {
+                const w = std.c.write(dfd, buf[written..to_write].ptr, to_write - written);
+                if (w < 0) {
+                    try mapCError();
+                    return error.SystemResources;
+                }
+                written += @intCast(w);
+            }
+        }
+
+        if (std.c.fchmod(dfd, file_mode) != 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        return;
+    } else if (std.c.S.ISDIR(st.mode)) {
+        if (std.c.mkdir(dst_z, 0o700) != 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+
+        const dir = std.c.opendir(src_z) orelse {
+            try mapCError();
+            return error.SystemResources;
+        };
+        defer _ = std.c.closedir(dir);
+
+        const src_span = std.mem.span(src_z);
+        const dst_span = std.mem.span(dst_z);
+
+        std.c._errno().* = 0;
+        while (std.c.readdir(dir)) |ent| {
+            const name = std.mem.sliceTo(&ent.name, 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+                std.c._errno().* = 0;
+                continue;
+            }
+
+            var child_src_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            var child_dst_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            const child_src_slice = std.fmt.bufPrint(child_src_buf[0 .. child_src_buf.len - 1], "{s}/{s}", .{ src_span, name }) catch return error.NameTooLong;
+            child_src_buf[child_src_slice.len] = 0;
+            const child_src: [*:0]const u8 = child_src_buf[0..child_src_slice.len :0];
+
+            const child_dst_slice = std.fmt.bufPrint(child_dst_buf[0 .. child_dst_buf.len - 1], "{s}/{s}", .{ dst_span, name }) catch return error.NameTooLong;
+            child_dst_buf[child_dst_slice.len] = 0;
+            const child_dst: [*:0]const u8 = child_dst_buf[0..child_dst_slice.len :0];
+
+            try copyTreeInner(child_src, child_dst);
+            std.c._errno().* = 0;
+        }
+        if (std.c._errno().* != 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+
+        const dir_mode: std.c.mode_t = @truncate(@as(u32, st.mode) & 0o7777);
+        if (std.c.chmod(dst_z, dir_mode) != 0) {
+            try mapCError();
+            return error.SystemResources;
+        }
+        return;
+    } else {
+        return error.InvalidArgument;
+    }
+}
+
+pub fn copyTree(src: []const u8, dst: []const u8) !void {
+    var src_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var dst_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    if (src.len >= src_buf.len or dst.len >= dst_buf.len) return error.NameTooLong;
+    @memcpy(src_buf[0..src.len], src);
+    src_buf[src.len] = 0;
+    @memcpy(dst_buf[0..dst.len], dst);
+    dst_buf[dst.len] = 0;
+
+    return copyTreeInner(src_buf[0..src.len :0], dst_buf[0..dst.len :0]);
+}
+
 pub fn cloneTree(src: []const u8, dst: []const u8) !CloneKind {
     if (builtin.os.tag == .linux) {
         return linux_impl.cloneTreeLinux(src, dst);
@@ -211,23 +356,17 @@ pub fn cloneTree(src: []const u8, dst: []const u8) !CloneKind {
         const rc = darwin.clonefile(src_z, dst_z, 0);
         if (rc != 0) {
             const err = std.c._errno().*;
-            return switch (err) {
-                @intFromEnum(std.posix.E.NOENT) => error.FileNotFound,
-                @intFromEnum(std.posix.E.EXIST) => error.PathAlreadyExists,
-                @intFromEnum(std.posix.E.ACCES), @intFromEnum(std.posix.E.PERM) => error.AccessDenied,
-                @intFromEnum(std.posix.E.NOSPC) => error.NoSpaceLeft,
-                @intFromEnum(std.posix.E.NAMETOOLONG) => error.NameTooLong,
-                @intFromEnum(std.posix.E.NOTDIR) => error.NotDir,
-                @intFromEnum(std.posix.E.LOOP) => error.SymLinkLoop,
-                @intFromEnum(std.posix.E.ROFS) => error.ReadOnlyFileSystem,
-                else => error.SystemResources,
-            };
+            if (err == @intFromEnum(std.posix.E.NOENT)) return error.FileNotFound;
+            if (err == @intFromEnum(std.posix.E.EXIST)) return error.PathAlreadyExists;
+            try copyTree(src, dst);
+            return .copy;
         }
         return .clonefile;
     } else {
         @compileError("unsupported OS tag for cloneTree");
     }
 }
+
 
 pub fn create(gpa: Allocator, io: Io, session_dir: []const u8, name: []const u8, fixture: ?[]const u8) !Run {
     const root = try std.Io.Dir.path.join(gpa, &.{ session_dir, "runs", name });
@@ -643,6 +782,131 @@ test "linux clone reports an unreadable file" {
 
     const res = cloneTree(src_path, dst_path);
     try std.testing.expectError(error.AccessDenied, res);
+}
+
+test "copyTree copies contents modes and symlinks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var tmp_path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(std.testing.io, &tmp_path_buf);
+    const tmp_path = tmp_path_buf[0..tmp_len];
+
+    // Outside file for symlink target
+    const outside_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
+    defer std.testing.allocator.free(outside_path);
+    const outside_file = try Io.Dir.cwd().createFile(std.testing.io, outside_path, .{});
+    try outside_file.writeStreamingAll(std.testing.io, "outside content\n");
+    outside_file.close(std.testing.io);
+
+    // Source directory
+    const src_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "src" });
+    defer std.testing.allocator.free(src_path);
+    try Io.Dir.cwd().createDirPath(std.testing.io, src_path);
+
+    // Regular file with mode 0o755
+    const exec_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "exec.sh" });
+    defer std.testing.allocator.free(exec_path);
+    const exec_file = try Io.Dir.cwd().createFile(std.testing.io, exec_path, .{});
+    try exec_file.writeStreamingAll(std.testing.io, "#!/bin/sh\necho ok\n");
+    exec_file.close(std.testing.io);
+    try Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        exec_path,
+        Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    );
+
+    // Subdirectory with mode 0o555 (read-only) containing a file
+    const ro_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "ro" });
+    defer std.testing.allocator.free(ro_path);
+    try Io.Dir.cwd().createDirPath(std.testing.io, ro_path);
+
+    const child_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ ro_path, "child.txt" });
+    defer std.testing.allocator.free(child_path);
+    const child_file = try Io.Dir.cwd().createFile(std.testing.io, child_path, .{});
+    try child_file.writeStreamingAll(std.testing.io, "child content\n");
+    child_file.close(std.testing.io);
+
+    try Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        ro_path,
+        Io.File.Permissions.fromMode(0o555),
+        .{ .follow_symlinks = false },
+    );
+    defer Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        ro_path,
+        Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    ) catch {};
+
+    // Symlink pointing outside without following
+    const link_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "link_to_outside" });
+    defer std.testing.allocator.free(link_path);
+    try Io.Dir.cwd().symLink(std.testing.io, "../outside", link_path, .{});
+
+    // Destination path
+    const dst_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "dst" });
+    defer std.testing.allocator.free(dst_path);
+
+    // Execute copyTree
+    try copyTree(src_path, dst_path);
+
+    const dst_ro_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_path, "ro" });
+    defer std.testing.allocator.free(dst_ro_path);
+    defer Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        dst_ro_path,
+        Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    ) catch {};
+
+    // Verify regular file content and mode
+    const dst_exec_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_path, "exec.sh" });
+    defer std.testing.allocator.free(dst_exec_path);
+    const exec_content = try Io.Dir.cwd().readFileAlloc(std.testing.io, dst_exec_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(exec_content);
+    try std.testing.expectEqualStrings("#!/bin/sh\necho ok\n", exec_content);
+
+    const exec_stat = try Io.Dir.cwd().statFile(std.testing.io, dst_exec_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), exec_stat.permissions.toMode() & 0o777);
+
+    // Verify read-only subdirectory mode and child content
+    const dst_child_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_ro_path, "child.txt" });
+    defer std.testing.allocator.free(dst_child_path);
+    const child_content = try Io.Dir.cwd().readFileAlloc(std.testing.io, dst_child_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(child_content);
+    try std.testing.expectEqualStrings("child content\n", child_content);
+
+    const ro_stat = try Io.Dir.cwd().statFile(std.testing.io, dst_ro_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o555), ro_stat.permissions.toMode() & 0o777);
+
+    // Verify symlink was copied as a link, not followed
+    const dst_link_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ dst_path, "link_to_outside" });
+    defer std.testing.allocator.free(dst_link_path);
+    const link_stat = try Io.Dir.cwd().statFile(std.testing.io, dst_link_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(Io.File.Kind.sym_link, link_stat.kind);
+
+    var target_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const target_len = try Io.Dir.cwd().readLink(std.testing.io, dst_link_path, &target_buf);
+    try std.testing.expectEqualStrings("../outside", target_buf[0..target_len]);
+
+    // Verify copyTree reports error on unreadable file
+    if (std.c.getuid() != 0) {
+        const unreadable_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ src_path, "unreadable.txt" });
+        defer std.testing.allocator.free(unreadable_path);
+        const uf = try Io.Dir.cwd().createFile(std.testing.io, unreadable_path, .{});
+        uf.close(std.testing.io);
+        try Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, Io.File.Permissions.fromMode(0o000), .{ .follow_symlinks = false });
+        defer Io.Dir.cwd().setFilePermissions(std.testing.io, unreadable_path, Io.File.Permissions.fromMode(0o644), .{ .follow_symlinks = false }) catch {};
+
+        const dst_err_path = try std.Io.Dir.path.join(std.testing.allocator, &.{ tmp_path, "dst_err" });
+        defer std.testing.allocator.free(dst_err_path);
+
+        const res = copyTree(src_path, dst_err_path);
+        try std.testing.expectError(error.AccessDenied, res);
+    }
 }
 
 
