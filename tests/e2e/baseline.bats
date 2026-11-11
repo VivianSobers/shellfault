@@ -1,0 +1,73 @@
+#!/usr/bin/env bats
+
+setup() {
+  load '../helpers.bash'
+  CORPUS_DIR="${BATS_TEST_DIRNAME}/../corpus"
+}
+
+teardown() {
+  if [ -d "shellfault-out" ]; then
+    git clean -fd shellfault-out >/dev/null 2>&1 || true
+  fi
+}
+
+@test "append twice is a RERUN finding" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/append-twice/buggy.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"RERUN: second run changed the workspace"* ]]
+  [[ "$output" == *"list.txt"* ]]
+}
+
+@test "mkdir without -p is a RERUN finding" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/mkdir-no-p/buggy.sh"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"RERUN: second run failed"* ]]
+}
+
+@test "fixed scripts pass the baseline" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/append-twice/fixed.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"baseline ok"* ]]
+
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/mkdir-no-p/fixed.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"baseline ok"* ]]
+}
+
+@test "nondeterministic script stops with exit 2" {
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${CORPUS_DIR}/nondeterministic/script.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"two clean runs differ:"* ]]
+}
+
+@test "failing reference stops with exit 2" {
+  mkscript "fail.sh" "exit 42"
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${BATS_TEST_TMPDIR}/fail.sh"
+  [ "$status" -eq 2 ]
+}
+
+@test "script path and args with spaces and globs" {
+  local dir="${BATS_TEST_TMPDIR}/dir with space"
+  mkdir -p "$dir"
+  local script="$dir/s*.sh"
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nprintf "%%s" "$1" > result.txt\n' > "$script"
+  chmod +x "$script"
+
+  local outdir="${BATS_TEST_TMPDIR}/sf-out"
+  run sf run --out "$outdir" "$script" -- "a b*"
+  [ "$status" -eq 0 ]
+
+  local result_file
+  result_file=$(find "$outdir" -name "result.txt" | head -n 1)
+  [ -f "$result_file" ]
+  [ "$(cat "$result_file")" = "a b*" ]
+}
+
+@test "no processes left after run" {
+  mkscript "bg.sh" "sleep 300 &"
+  run sf run --out "${BATS_TEST_TMPDIR}/out" "${BATS_TEST_TMPDIR}/bg.sh"
+  [ "$status" -eq 0 ]
+  run pgrep -f 'sleep 300'
+  [ "$status" -eq 1 ]
+}
