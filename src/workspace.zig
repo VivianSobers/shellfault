@@ -328,6 +328,11 @@ fn copyTreeInner(src_z: [*:0]const u8, dst_z: [*:0]const u8) !void {
 }
 
 pub fn copyTree(src: []const u8, dst: []const u8) !void {
+    // Linux libc has no fstatat in Zig's std.c; the Linux clone path already copies when FICLONE fails.
+    if (builtin.os.tag == .linux) {
+        _ = try linux_impl.cloneTreeLinux(src, dst);
+        return;
+    }
     var src_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     var dst_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     if (src.len >= src_buf.len or dst.len >= dst_buf.len) return error.NameTooLong;
