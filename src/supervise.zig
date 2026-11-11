@@ -216,6 +216,19 @@ fn cleanupLeftovers(gpa: Allocator, run_id: []const u8) !u32 {
     return 0;
 }
 
+fn hasNulDelimitedEntry(haystack: []const u8, entry: []const u8) bool {
+    if (entry.len == 0 or haystack.len < entry.len) return false;
+    var i: usize = 0;
+    while (i + entry.len <= haystack.len) : (i += 1) {
+        if (!std.mem.eql(u8, haystack[i .. i + entry.len], entry)) continue;
+        const bounded_left = i == 0 or haystack[i - 1] == 0;
+        const after = i + entry.len;
+        const bounded_right = after == haystack.len or haystack[after] == 0;
+        if (bounded_left and bounded_right) return true;
+    }
+    return false;
+}
+
 fn cleanupDarwin(gpa: Allocator, run_id: []const u8) !u32 {
     if (!builtin.os.tag.isDarwin()) return 0;
     const my_uid = std.c.getuid();
@@ -249,7 +262,7 @@ fn cleanupDarwin(gpa: Allocator, run_id: []const u8) !u32 {
         var args_mib = [_]c_int{ std.c.CTL.KERN, std.c.KERN.PROCARGS2, pid };
         var args_len: usize = args_buf.len;
         if (std.c.sysctl(&args_mib, 3, &args_buf, &args_len, null, 0) == 0) {
-            if (std.mem.indexOf(u8, args_buf[0..args_len], marker) != null) {
+            if (hasNulDelimitedEntry(args_buf[0..args_len], marker)) {
                 try to_kill.append(gpa, pid);
             }
         }
@@ -315,7 +328,7 @@ fn cleanupLinux(gpa: Allocator, run_id: []const u8) !u32 {
         const bytes = readFileAlloc(gpa, env_path, 1 << 20) catch continue;
         defer gpa.free(bytes);
 
-        if (std.mem.indexOf(u8, bytes, marker) == null) continue;
+        if (!hasNulDelimitedEntry(bytes, marker)) continue;
 
         _ = std.c.kill(pid, std.c.SIG.TERM);
         try killed.append(gpa, pid);
@@ -633,3 +646,57 @@ test "output goes to the given files" {
     try std.testing.expect(std.mem.indexOf(u8, out_bytes, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, err_bytes, "ohno") != null);
 }
+
+test "cleanup leaves another run's processes alone" {
+    const gpa = std.testing.allocator;
+    var other_env = try initTestEnv(gpa);
+    defer other_env.deinit();
+    try other_env.put("SF_RUN_ID", "t5-scope-other");
+
+    var env_block = try other_env.createPosixBlock(gpa, .{});
+    defer env_block.deinit(gpa);
+
+    const argv_block = try makeArgv(gpa, &[_][]const u8{ "/bin/sh", "-c", "exec sleep 30" });
+    defer argv_block.deinit(gpa);
+
+    const other_pid = std.c.fork();
+    try std.testing.expect(other_pid >= 0);
+    if (other_pid == 0) {
+        _ = std.c.execve("/bin/sh", argv_block.slice.ptr, env_block.slice.ptr);
+        std.c.exit(127);
+    }
+    defer {
+        _ = std.c.kill(other_pid, std.c.SIG.KILL);
+        var status: c_int = 0;
+        _ = std.c.waitpid(other_pid, &status, 0);
+    }
+
+    sleepMs(50);
+
+    var env = try initTestEnv(gpa);
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try tmpDirPath(gpa, &tmp);
+    defer gpa.free(cwd);
+    const out = try makePath(gpa, cwd, "stdout.log");
+    defer gpa.free(out);
+    const err = try makePath(gpa, cwd, "stderr.log");
+    defer gpa.free(err);
+
+    const spec = Spec{
+        .argv = &[_][]const u8{ "/bin/sh", "-c", "exit 0" },
+        .env = &env,
+        .cwd = cwd,
+        .stdout_path = out,
+        .stderr_path = err,
+        .timeout_ms = 5000,
+        .run_id = "t5-scope",
+    };
+    const got = try run(gpa, spec);
+    try std.testing.expectEqualDeep(Exit{ .code = 0 }, got.exit);
+
+    try std.testing.expect(pidAlive(other_pid));
+}
+

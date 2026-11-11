@@ -246,6 +246,11 @@ fn getWsTokens(
     }
 }
 
+fn makeRunId(gpa: Allocator, session_dir: []const u8, run_name: []const u8) ![]const u8 {
+    const session_name = std.fs.path.basename(session_dir);
+    return std.fmt.allocPrint(gpa, "{s}-{s}", .{ session_name, run_name });
+}
+
 pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     deinitErrors(gpa);
 
@@ -337,6 +342,13 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
     var base_env = try getSystemEnvMap(gpa);
     defer base_env.deinit();
 
+    const ref1_run_id = try makeRunId(gpa, session_dir, "ref1");
+    defer gpa.free(ref1_run_id);
+    const ref2_run_id = try makeRunId(gpa, session_dir, "ref2");
+    defer gpa.free(ref2_run_id);
+    const rerun_run_id = try makeRunId(gpa, session_dir, "rerun");
+    defer gpa.free(rerun_run_id);
+
     // Run 1: ref1
     const ref1 = try workspace.create(gpa, io, session_dir, "ref1", abs_fixture);
     defer ref1.deinit(gpa);
@@ -358,7 +370,7 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
         .stdout_path = ref1_stdout,
         .stderr_path = ref1_stderr,
         .timeout_ms = opts.timeout_s * 1000,
-        .run_id = "ref1",
+        .run_id = ref1_run_id,
     });
 
     if (res1.timed_out or res1.exit != .code or res1.exit.code != 0) {
@@ -402,7 +414,7 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
         .stdout_path = ref2_stdout,
         .stderr_path = ref2_stderr,
         .timeout_ms = opts.timeout_s * 1000,
-        .run_id = "ref2",
+        .run_id = ref2_run_id,
     });
 
     if (res2.timed_out or res2.exit != .code or res2.exit.code != 0) {
@@ -464,7 +476,7 @@ pub fn baseline(gpa: Allocator, io: std.Io, opts: cli.RunOptions) !Baseline {
         .stdout_path = rerun_stdout,
         .stderr_path = rerun_stderr,
         .timeout_ms = opts.timeout_s * 1000,
-        .run_id = "rerun",
+        .run_id = rerun_run_id,
     });
 
     var rerun_finding: ?RerunFinding = null;
