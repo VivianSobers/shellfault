@@ -9,6 +9,7 @@ test {
     _ = @import("workspace.zig");
     _ = @import("trace.zig");
     _ = @import("points.zig");
+    _ = @import("supervise.zig");
 }
 
 pub fn main(init: std.process.Init) u8 {
