@@ -5,6 +5,10 @@ pub const lua = @import("lua.zig");
 test {
     _ = cli;
     _ = lua;
+    _ = @import("manifest.zig");
+    _ = @import("workspace.zig");
+    _ = @import("trace.zig");
+    _ = @import("points.zig");
 }
 
 pub fn main(init: std.process.Init) u8 {
