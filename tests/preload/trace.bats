@@ -211,3 +211,23 @@ run_script() {
   done
 }
 
+@test "preload's own trap wrapper is not traced" {
+  local script="$BATS_TEST_TMPDIR/script.sh"
+  mkscript "$script" \
+    "trap 'echo bye' EXIT" \
+    "true"
+
+  for bash_bin in $(get_bashes); do
+    rm -f "$TEST_CTL/trace.log"
+    run_script "$bash_bin" "$script"
+    [ -f "$TEST_CTL/trace.log" ]
+    local preload_b_count
+    preload_b_count="$(awk -F'\t' '$1 == "B" && $3 ~ /preload\.bash$/ { count++ } END { print count+0 }' "$TEST_CTL/trace.log")"
+    [ "$preload_b_count" -eq 0 ]
+    local ids
+    ids="$(awk -F'\t' '$1 == "B" { print $2 }' "$TEST_CTL/trace.log" | tr '\n' ' ' | sed 's/ $//')"
+    [ "$ids" = "1 2 3" ]
+  done
+}
+
+

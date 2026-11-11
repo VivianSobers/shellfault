@@ -17,6 +17,7 @@ fi
 SF_TRACE_FD="${SF_TRACE_FD:-87}"
 eval "exec $SF_TRACE_FD>>\"\$SF_CTL/trace.log\""
 
+__sf_self="${BASH_SOURCE[0]}"
 __sf_depth=0
 __sf_prefix=""
 __sf_n=0
@@ -52,6 +53,10 @@ trap() {
 }
 
 __sf_trap() {
+  if [ "${BASH_SOURCE[1]}" = "$__sf_self" ]; then
+    return 0
+  fi
+
   local __sf_sub="$BASH_SUBSHELL" || :
   if [ "$__sf_sub" -gt "$__sf_depth" ]; then
     __sf_prefix="${__sf_id:-0}" || :
