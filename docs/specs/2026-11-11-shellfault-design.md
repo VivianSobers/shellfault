@@ -210,8 +210,12 @@ The end state of a trial has three parts:
    `sqlite3 app.db .dump` and `crontab -l` run against a stub.
 3. The effects journal (next section).
 
-Scenarios can ignore paths by glob and can pass a file's content through a Lua normalizer before hashing,
-for files that contain timestamps or PIDs. Diffs report added, removed and changed paths, with a unified
+Each run has its own workspace path, and scripts often write absolute paths into files (a `PATH` line in
+`~/.profile`, a config file, a symlink). Before hashing, the engine therefore replaces every occurrence of
+the run's workspace path, as given and as resolved (macOS resolves `/var` to `/private/var`), with a fixed
+token in file contents and symlink targets, so two equivalent runs compare equal. Scenarios can also ignore
+paths by glob and can pass a file's content through a Lua normalizer before hashing, for files that contain
+timestamps or PIDs. Diffs report added, removed and changed paths, with a unified
 diff for small text files.
 
 ## Isolation and side effects

@@ -170,8 +170,13 @@ version, the observed output and the decision it implies.
     first word after leading `NAME=value` assignments). If the first word contains `$`, `name` is `?`.
   - `W id source line debug-trap-replaced`: the script set its own `DEBUG` trap at that line.
 - Behavior: only the process whose `$$` equals `SF_ROOT` traces; the preload exports `SF_ROOT=$$` when it is
-  unset, so child Bash scripts stay silent. Pipeline elements and background jobs do not emit `B` records
-  (per S1). `RANDOM` is seeded with `SF_SEED`. A `trap` function wraps the builtin: any call that names
+  unset, so child Bash scripts stay silent. Simple commands in a pipeline or background job are boundaries
+  of the parent, in order, because the parent runs the trap before forking them (spike S1, Bash 3.2 and
+  5.3). Compound commands that run in a child (`... | while read`, `{ ...; } &`) and process substitutions
+  trace with IDs nested under the parent's current boundary; concurrent siblings may produce the same ID,
+  and on Bash 3.2 a process substitution reports `BASH_SUBSHELL=0`, so its IDs can collide with the main
+  process. The engine handles both (Task 8). The trap uses no command substitutions, pipes or external
+  commands. `RANDOM` is seeded with `SF_SEED`. A `trap` function wraps the builtin: any call that names
   `DEBUG` writes the `W` record and is then passed to `builtin trap` unchanged; all other calls pass through
   unchanged, including `trap -p` and `trap -l`.
 
@@ -182,7 +187,10 @@ version, the observed output and the decision it implies.
     gives `1`, `1/1`, `1/2`); `test "function body commands carry the function name"` (`f(){ true; }; f`
     gives a record with `funcs` = `f`); `test "external command is recorded"` (`/bin/ls >/dev/null` and
     `ls >/dev/null` both produce `X` with `ls` or `/bin/ls`); `test "newline and tab in command are
-    escaped"`; `test "child bash script is not traced"`; `test "pipeline elements emit no boundaries"`;
+    escaped"`; `test "child bash script is not traced"`; `test "simple pipeline elements are parent
+    boundaries in order"` (`echo a | cat >/dev/null` gives top-level ids `1` and `2`); `test "loop fed by a
+    pipe is nested under the producer"` (`printf '1\n' | while read -r l; do :; done` gives `1`, then ids
+    starting with `1/`);
     `test "replacing the DEBUG trap is reported"` (script runs `trap 'true' DEBUG` on line 2; expect a `W`
     record with line `2`).
   - `transparency.bats`: `test "exit status visible after command"` (`false; echo $?` prints `1`);
@@ -310,12 +318,17 @@ version, the observed output and the decision it implies.
   - `pub const Trace = struct { boundaries: []Boundary, calls: []Call, warnings: []Warning }`
   - `pub fn parse(gpa, text: []const u8) !Trace`; a malformed line returns `error.BadTrace` and the parser
     records its line number.
+  - `pub fn stable(gpa, a: Trace, b: Trace) ![]const Boundary`: the boundaries of `a`, in order, whose id
+    occurs exactly once in `a` and exactly once in `b` with the same source, line and command. Only stable
+    boundaries can be crash points; the rest are counted as ambiguous.
   - `pub fn firstAndLastPerLine(gpa, bs: []const Boundary) ![]const Boundary`: for each `(source, line)`,
     the first and the last boundary in trace order (one if they are the same), in trace order.
 
 - [ ] **Step 1: Write failing Zig tests:** `test "parses all record kinds"`; `test "unescapes command"`;
   `test "bad line is an error with its number"`; `test "loop line keeps first and last"` (five boundaries
-  on line 3 and one on line 4 give three results, in order).
+  on line 3 and one on line 4 give three results, in order); `test "duplicate id is not stable"`;
+  `test "id with a different command in the second trace is not stable"`; `test "identical traces are
+  fully stable"`.
 - [ ] **Step 2: Run** `zig build test`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `zig build test`. Expected: PASS.
@@ -343,7 +356,10 @@ version, the observed output and the decision it implies.
     `ref1`'s workspace into `rerun`, runs the script there, and fills `rerun`.
   - The Bash used is `opts.bash`, else the interpreter named on the script's `#!` line (`/usr/bin/env bash`
     resolves `bash` on `PATH`), else `bash` on `PATH`.
+  - Crash points are `points.firstAndLastPerLine(trace.stable(ref1, ref2))`, and `Baseline` also carries
+    `ambiguous: usize`, the number of boundaries in `ref1` that are not stable.
   - `shellfault points`: prints one line per selected boundary, `id  source:line  command`, then
+    `skipped: K ambiguous boundaries` when K > 0, then
     `external: name (N calls)` per distinct external command, then each warning as
     `warning: source:line: DEBUG trap replaced; later points are not covered`. Exit 0.
   - `shellfault run`: prints `RERUN: second run failed (exit N)` or `RERUN: second run changed the
@@ -367,23 +383,55 @@ version, the observed output and the decision it implies.
 - [ ] **Step 5: Run** `zig build test e2e` on macOS and Linux. Expected: PASS.
 - [ ] **Step 6: Commit** `feat: add baseline points and rerun`
 
-### Task 10: Checks and CI
+### Task 9b: Normalize workspace paths
+
+Added after Task 9: an installer that writes `$PWD/bin` into `~/.profile` was reported nondeterministic,
+because each run has a different workspace path.
 
 **Files:**
-- Modify: `flake.nix` (add `checks`)
-- Create: `.github/workflows/ci.yml`
+- Modify: `src/manifest.zig`, `src/session.zig`
+- Create: `tests/corpus/abs-path/script.sh`, a test in `tests/e2e/baseline.bats`
 
 **Interfaces:**
-- Produces: `nix flake check` runs `zig build test`, `zig build e2e`, `bats tests/preload` against every
-  Bash in the matrix, and `shellcheck -x` over all shell files. CI runs `nix flake check` on
-  `ubuntu-latest` and `macos-latest` for pushes and pull requests to `main`.
+- Changes: `manifest.build(gpa, io, root, ignores, path_tokens: []const []const u8) !Manifest`. Before
+  hashing a regular file of at most 64 MiB, and before recording a symlink target, every occurrence of any
+  string in `path_tokens` is replaced by `@SF_WS@`; `size` is the size after replacement. Larger files are
+  hashed unchanged.
+- `session.baseline` passes, for each run, `{ run.ws, realpath(run.ws) }` (one entry if they are equal).
 
-- [ ] **Step 1: Add the checks**, then break one shell file on purpose (an unquoted `$var`) and run
-  `nix flake check`. Expected: FAIL naming that file. Revert the break.
-- [ ] **Step 2: Run** `nix flake check` on macOS and Linux. Expected: PASS.
+- [ ] **Step 1: Write failing tests.** Zig: `test "workspace path in content is normalized"` (two trees at
+  different paths, each with a file containing its own absolute root path, give equal manifests when built
+  with their own root as token) and `test "absolute symlink into workspace is normalized"`. Corpus
+  `abs-path/script.sh`: `printf 'PATH=%s/bin\n' "$PWD" >> "$HOME/.profile"; mkdir -p bin; ln -sfn "$PWD/bin"
+  current`. Bats `test "absolute workspace paths do not make runs differ"`: `shellfault run` on it exits 0
+  with `baseline ok`.
+- [ ] **Step 2: Run** `zig build test` and `zig build e2e`. Expected: the new tests FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** both again. Expected: PASS.
+- [ ] **Step 5: Commit** `fix: normalize workspace paths in manifests`
+
+### Task 10: Checks and CI
+
+Revised after Tasks 1 to 9: `zig build` downloads the Lua sources, and Nix's build sandbox has no network,
+so the checks run inside `nix develop` instead of as `nix flake check` derivations. Linux-only code was
+also once merged without being compiled for Linux, so the checks cross-compile.
+
+**Files:**
+- Create: `scripts/check.sh`, `.github/workflows/ci.yml`
+
+**Interfaces:**
+- Produces: `nix develop -c scripts/check.sh` runs, stopping at the first failure and naming it:
+  `zig build test`, `zig build e2e`, `bats tests/preload` (every Bash in `SF_TEST_BASHES`),
+  `shellcheck -x` over every `*.sh`, `*.bash` and `*.bats` file tracked by git, and
+  `zig build -Dtarget=x86_64-linux-musl` and `zig build -Dtarget=aarch64-macos` (cross-compile only).
+  CI runs it on `ubuntu-latest` and `macos-latest` for pushes and pull requests to `main`.
+
+- [ ] **Step 1: Write `scripts/check.sh`**, then break one shell file on purpose (an unquoted `$var`) and run
+  `nix develop -c scripts/check.sh`. Expected: FAIL naming that file. Revert the break.
+- [ ] **Step 2: Run** `nix develop -c scripts/check.sh` on macOS and Linux. Expected: PASS.
 - [ ] **Step 3: Add the workflow** with `DeterminateSystems/nix-installer-action` and
-  `DeterminateSystems/magic-nix-cache-action`.
-- [ ] **Step 4: Commit** `ci: run flake checks on push`
+  `DeterminateSystems/magic-nix-cache-action`, running `nix develop -c scripts/check.sh`.
+- [ ] **Step 4: Commit** `ci: run checks on push`
 
 ## Execution notes
 
